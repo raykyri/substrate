@@ -113,8 +113,8 @@ impl PiecewiseLinear {
 ///
 /// Using the constants:
 /// * `I_0` = 0.025;
-/// * `i_ideal` = 0.2;
-/// * `x_ideal` = 0.5;
+/// * `i_ideal` = 0.1;
+/// * `x_ideal` = 0.8;
 /// * `d` = 0.05;
 ///
 /// This approximation is tested to be close to real one by an error less than 1% see
