@@ -92,7 +92,7 @@ struct PiecewiseLinear {
 	/// * the n-th segment starts at the abscissa of the n-th element until the abscissa of the
 	///     n-th + 1 element, and is defined by the linear function of the n-th element
 	/// * last segment doesn't end
-	pieces: [(u32, Linear); 20],
+	pieces: [(u32, Linear); 11],
 }
 
 impl PiecewiseLinear {
