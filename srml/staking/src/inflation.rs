@@ -200,6 +200,11 @@ mod test_inflation {
 	const i_ideal: f64 = 0.2;
 	const x_ideal: f64 = 0.5;
 	const d: f64 = 0.05;
+	/// Used in Edgeware
+	/// const I_0: f64 = 0.025;
+	/// const i_ideal: f64 = 0.10;
+	/// const x_ideal: f64 = 0.80;
+	/// const d: f64 = 0.05;
 
 	// Left part from `x_ideal`
 	fn I_left(x: f64) -> f64 {
