@@ -24,18 +24,6 @@ use primitives::u32_trait::Value as U32;
 use crate::sr_primitives::traits::{MaybeSerializeDebug, SimpleArithmetic, Saturating};
 use crate::sr_primitives::ConsensusEngineId;
 
-use super::for_each_tuple;
-
-/// A trait that can return the default value of a storage item. This must only ever be implemented
-/// for a special delegator struct for each storage item
-pub trait StorageDefault<V>: Sized {
-	/// Return the default value of type `V`. `None`, if `V` does not have a proper default value.
-	fn default() -> Option<V>;
-}
-
-// FIXME #1466 This is needed for `storage_items!`. Should be removed once it is deprecated.
-impl<T: Default> StorageDefault<T> for () { fn default() -> Option<T> { Some(Default::default()) } }
-
 /// Anything that can have a `::len()` method.
 pub trait Len {
 	/// Return the length of data type.
@@ -73,28 +61,11 @@ impl<V: PartialEq, T: Get<V>> Contains<V> for T {
 }
 
 /// The account with the given id was killed.
+#[impl_trait_for_tuples::impl_for_tuples(30)]
 pub trait OnFreeBalanceZero<AccountId> {
 	/// The account was the given id was killed.
 	fn on_free_balance_zero(who: &AccountId);
 }
-
-macro_rules! impl_on_free_balance_zero {
-	() => (
-		impl<AccountId> OnFreeBalanceZero<AccountId> for () {
-			fn on_free_balance_zero(_: &AccountId) {}
-		}
-	);
-
-	( $($t:ident)* ) => {
-		impl<AccountId, $($t: OnFreeBalanceZero<AccountId>),*> OnFreeBalanceZero<AccountId> for ($($t,)*) {
-			fn on_free_balance_zero(who: &AccountId) {
-				$($t::on_free_balance_zero(who);)*
-			}
-		}
-	}
-}
-
-for_each_tuple!(impl_on_free_balance_zero);
 
 /// Trait for a hook to get called when some balance has been minted, causing dilution.
 pub trait OnDilution<Balance> {
@@ -649,6 +620,16 @@ pub trait Time {
 
 impl WithdrawReasons {
 	/// Choose all variants except for `one`.
+	///
+	/// ```rust
+	/// # use srml_support::traits::{WithdrawReason, WithdrawReasons};
+	/// # fn main() {
+	/// assert_eq!(
+	/// 	WithdrawReason::Fee | WithdrawReason::Transfer | WithdrawReason::Reserve,
+	/// 	WithdrawReasons::except(WithdrawReason::TransactionPayment),
+	///	);
+	/// # }
+	/// ```
 	pub fn except(one: WithdrawReason) -> WithdrawReasons {
 		let mut mask = Self::all();
 		mask.toggle(one);

@@ -39,7 +39,7 @@ use client::{runtime_api::BlockT, Client};
 use exit_future::Signal;
 use futures::prelude::*;
 use futures03::stream::{StreamExt as _, TryStreamExt as _};
-use network::{NetworkService, NetworkState, specialization::NetworkSpecialization};
+use network::{NetworkService, NetworkState, specialization::NetworkSpecialization, Event, DhtEvent};
 use log::{log, warn, debug, error, Level};
 use codec::{Encode, Decode};
 use primitives::{Blake2Hasher, H256};
@@ -66,7 +66,7 @@ pub use futures::future::Executor;
 const DEFAULT_PROTOCOL_ID: &str = "sup";
 
 /// Substrate service.
-pub struct NewService<TCfg, TBl, TCl, TSc, TNetStatus, TNet, TTxPool, TOc> {
+pub struct NewService<TBl, TCl, TSc, TNetStatus, TNet, TTxPool, TOc> {
 	client: Arc<TCl>,
 	select_chain: Option<TSc>,
 	network: Arc<TNet>,
@@ -91,8 +91,6 @@ pub struct NewService<TCfg, TBl, TCl, TSc, TNetStatus, TNet, TTxPool, TOc> {
 	/// If spawning a background task is not possible, we instead push the task into this `Vec`.
 	/// The elements must then be polled manually.
 	to_poll: Vec<Box<dyn Future<Item = (), Error = ()> + Send>>,
-	/// Configuration of this Service
-	config: TCfg,
 	rpc_handlers: rpc_servers::RpcHandler<rpc::Metadata>,
 	_rpc: Box<dyn std::any::Any + Send + Sync>,
 	_telemetry: Option<tel::Telemetry>,
@@ -113,13 +111,15 @@ pub type TaskExecutor = Arc<dyn Executor<Box<dyn Future<Item = (), Error = ()> +
 #[derive(Clone)]
 pub struct SpawnTaskHandle {
 	sender: mpsc::UnboundedSender<Box<dyn Future<Item = (), Error = ()> + Send>>,
+	on_exit: exit_future::Exit,
 }
 
 impl Executor<Box<dyn Future<Item = (), Error = ()> + Send>> for SpawnTaskHandle {
 	fn execute(
 		&self,
-		future: Box<dyn Future<Item = (), Error = ()> + Send>
+		future: Box<dyn Future<Item = (), Error = ()> + Send>,
 	) -> Result<(), futures::future::ExecuteError<Box<dyn Future<Item = (), Error = ()> + Send>>> {
+		let future = Box::new(future.select(self.on_exit.clone()).then(|_| Ok(())));
 		if let Err(err) = self.sender.unbounded_send(future) {
 			let kind = futures::future::ExecuteErrorKind::Shutdown;
 			Err(futures::future::ExecuteError::new(kind, err.into_inner()))
@@ -148,6 +148,7 @@ macro_rules! new_impl {
 		let (
 			client,
 			on_demand,
+			backend,
 			keystore,
 			select_chain,
 			import_queue,
@@ -155,8 +156,9 @@ macro_rules! new_impl {
 			finality_proof_provider,
 			network_protocol,
 			transaction_pool,
-			rpc_extensions
-		) = $build_components(&mut $config)?;
+			rpc_extensions,
+			dht_event_tx,
+		) = $build_components(&$config)?;
 		let import_queue = Box::new(import_queue);
 		let chain_info = client.info().chain;
 
@@ -206,8 +208,7 @@ macro_rules! new_impl {
 		let network = network_mut.service().clone();
 		let network_status_sinks = Arc::new(Mutex::new(Vec::new()));
 
-		#[allow(deprecated)]
-		let offchain_storage = client.backend().offchain_storage();
+		let offchain_storage = backend.offchain_storage();
 		let offchain_workers = match ($config.offchain_worker, offchain_storage) {
 			(true, Some(db)) => {
 				Some(Arc::new(offchain::OffchainWorkers::new(client.clone(), db)))
@@ -239,6 +240,7 @@ macro_rules! new_impl {
 							&BlockId::hash(notification.hash),
 							&*client,
 							&*txpool,
+							&notification.retracted,
 						).map_err(|e| warn!("Pool error processing new block: {:?}", e))?;
 					}
 
@@ -301,9 +303,7 @@ macro_rules! new_impl {
 			let bandwidth_download = net_status.average_download_per_sec;
 			let bandwidth_upload = net_status.average_upload_per_sec;
 
-			#[allow(deprecated)]
-			let backend = (*client_).backend();
-			let used_state_cache_size = match backend.used_state_cache_size(){
+			let used_state_cache_size = match info.used_state_cache_size {
 				Some(size) => size,
 				None => 0,
 			};
@@ -349,9 +349,10 @@ macro_rules! new_impl {
 			};
 			$start_rpc(
 				client.clone(),
+				//light_components.clone(),
 				system_rpc_tx.clone(),
 				system_info.clone(),
-				Arc::new(SpawnTaskHandle { sender: to_spawn_tx.clone() }),
+				Arc::new(SpawnTaskHandle { sender: to_spawn_tx.clone(), on_exit: exit.clone() }),
 				transaction_pool.clone(),
 				rpc_extensions.clone(),
 				keystore.clone(),
@@ -360,12 +361,14 @@ macro_rules! new_impl {
 		let rpc_handlers = gen_handler();
 		let rpc = start_rpc_servers(&$config, gen_handler)?;
 
+
 		let _ = to_spawn_tx.unbounded_send(Box::new(build_network_future(
 			network_mut,
 			client.clone(),
 			network_status_sinks.clone(),
 			system_rpc_rx,
-			has_bootnodes
+			has_bootnodes,
+			dht_event_tx,
 		)
 			.map_err(|_| ())
 			.select(exit.clone())
@@ -426,7 +429,6 @@ macro_rules! new_impl {
 			to_spawn_tx,
 			to_spawn_rx,
 			to_poll: Vec::new(),
-			$config,
 			rpc_handlers,
 			_rpc: rpc,
 			_telemetry: telemetry,
@@ -451,8 +453,6 @@ pub trait AbstractService: 'static + Future<Item = (), Error = Error> +
 	type CallExecutor: 'static + client::CallExecutor<Self::Block, Blake2Hasher> + Send + Sync + Clone;
 	/// API that the runtime provides.
 	type RuntimeApi: Send + Sync;
-	/// Configuration struct of the service.
-	type Config;
 	/// Chain selection algorithm.
 	type SelectChain: consensus_common::SelectChain<Self::Block>;
 	/// API of the transaction pool.
@@ -462,12 +462,6 @@ pub trait AbstractService: 'static + Future<Item = (), Error = Error> +
 
 	/// Get event stream for telemetry connection established events.
 	fn telemetry_on_connect_stream(&self) -> mpsc::UnboundedReceiver<()>;
-
-	/// Returns the configuration passed on construction.
-	fn config(&self) -> &Self::Config;
-
-	/// Returns the configuration passed on construction.
-	fn config_mut(&mut self) -> &mut Self::Config;
 
 	/// return a shared instance of Telemetry (if enabled)
 	fn telemetry(&self) -> Option<tel::Telemetry>;
@@ -516,10 +510,10 @@ pub trait AbstractService: 'static + Future<Item = (), Error = Error> +
 	fn on_exit(&self) -> ::exit_future::Exit;
 }
 
-impl<TCfg, TBl, TBackend, TExec, TRtApi, TSc, TNetSpec, TExPoolApi, TOc> AbstractService for
-	NewService<TCfg, TBl, Client<TBackend, TExec, TBl, TRtApi>, TSc, NetworkStatus<TBl>,
+impl<TBl, TBackend, TExec, TRtApi, TSc, TNetSpec, TExPoolApi, TOc> AbstractService for
+	NewService<TBl, Client<TBackend, TExec, TBl, TRtApi>, TSc, NetworkStatus<TBl>,
 		NetworkService<TBl, TNetSpec, H256>, TransactionPool<TExPoolApi>, TOc>
-where TCfg: 'static + Send,
+where
 	TBl: BlockT<Hash = H256>,
 	TBackend: 'static + client::backend::Backend<TBl, Blake2Hasher>,
 	TExec: 'static + client::CallExecutor<TBl, Blake2Hasher> + Send + Sync + Clone,
@@ -533,18 +527,9 @@ where TCfg: 'static + Send,
 	type Backend = TBackend;
 	type CallExecutor = TExec;
 	type RuntimeApi = TRtApi;
-	type Config = TCfg;
 	type SelectChain = TSc;
 	type TransactionPoolApi = TExPoolApi;
 	type NetworkSpecialization = TNetSpec;
-
-	fn config(&self) -> &Self::Config {
-		&self.config
-	}
-
-	fn config_mut(&mut self) -> &mut Self::Config {
-		&mut self.config
-	}
 
 	fn telemetry_on_connect_stream(&self) -> mpsc::UnboundedReceiver<()> {
 		let (sink, stream) = mpsc::unbounded();
@@ -561,22 +546,25 @@ where TCfg: 'static + Send,
 	}
 
 	fn spawn_task(&self, task: impl Future<Item = (), Error = ()> + Send + 'static) {
+		let task = task.select(self.on_exit()).then(|_| Ok(()));
 		let _ = self.to_spawn_tx.unbounded_send(Box::new(task));
 	}
 
 	fn spawn_essential_task(&self, task: impl Future<Item = (), Error = ()> + Send + 'static) {
 		let essential_failed = self.essential_failed.clone();
-		let essential_task = Box::new(task.map_err(move |_| {
+		let essential_task = task.map_err(move |_| {
 			error!("Essential task failed. Shutting down service.");
 			essential_failed.store(true, Ordering::Relaxed);
-		}));
+		});
+		let task = essential_task.select(self.on_exit()).then(|_| Ok(()));
 
-		let _ = self.to_spawn_tx.unbounded_send(essential_task);
+		let _ = self.to_spawn_tx.unbounded_send(Box::new(task));
 	}
 
 	fn spawn_task_handle(&self) -> SpawnTaskHandle {
 		SpawnTaskHandle {
 			sender: self.to_spawn_tx.clone(),
+			on_exit: self.on_exit(),
 		}
 	}
 
@@ -606,13 +594,14 @@ where TCfg: 'static + Send,
 		self.transaction_pool.clone()
 	}
 
-	fn on_exit(&self) -> ::exit_future::Exit {
+	fn on_exit(&self) -> exit_future::Exit {
 		self.exit.clone()
 	}
 }
 
-impl<TCfg, TBl, TCl, TSc, TNetStatus, TNet, TTxPool, TOc> Future for
-NewService<TCfg, TBl, TCl, TSc, TNetStatus, TNet, TTxPool, TOc> {
+impl<TBl, TCl, TSc, TNetStatus, TNet, TTxPool, TOc> Future for
+	NewService<TBl, TCl, TSc, TNetStatus, TNet, TTxPool, TOc>
+{
 	type Item = ();
 	type Error = Error;
 
@@ -643,8 +632,9 @@ NewService<TCfg, TBl, TCl, TSc, TNetStatus, TNet, TTxPool, TOc> {
 	}
 }
 
-impl<TCfg, TBl, TCl, TSc, TNetStatus, TNet, TTxPool, TOc> Executor<Box<dyn Future<Item = (), Error = ()> + Send>> for
-NewService<TCfg, TBl, TCl, TSc, TNetStatus, TNet, TTxPool, TOc> {
+impl<TBl, TCl, TSc, TNetStatus, TNet, TTxPool, TOc> Executor<Box<dyn Future<Item = (), Error = ()> + Send>> for
+	NewService<TBl, TCl, TSc, TNetStatus, TNet, TTxPool, TOc>
+{
 	fn execute(
 		&self,
 		future: Box<dyn Future<Item = (), Error = ()> + Send>
@@ -672,6 +662,7 @@ fn build_network_future<
 	status_sinks: Arc<Mutex<Vec<mpsc::UnboundedSender<(NetworkStatus<B>, NetworkState)>>>>,
 	rpc_rx: futures03::channel::mpsc::UnboundedReceiver<rpc::system::Request<B>>,
 	should_have_peers: bool,
+	dht_event_tx: Option<mpsc::Sender<DhtEvent>>,
 ) -> impl Future<Item = (), Error = ()> {
 	// Compatibility shim while we're transitionning to stable Futures.
 	// See https://github.com/paritytech/substrate/issues/3099
@@ -725,7 +716,9 @@ fn build_network_future<
 					).collect());
 				}
 				rpc::system::Request::NetworkState(sender) => {
-					let _ = sender.send(network.network_state());
+					if let Some(network_state) = serde_json::to_value(&network.network_state()).ok() {
+						let _ = sender.send(network_state);
+					}
 				}
 			};
 		}
@@ -747,11 +740,21 @@ fn build_network_future<
 		}
 
 		// Main network polling.
-		match network.poll() {
-			Ok(Async::NotReady) => {}
-			Err(err) => warn!(target: "service", "Error in network: {:?}", err),
-			Ok(Async::Ready(())) => warn!(target: "service", "Network service finished"),
-		}
+		while let Ok(Async::Ready(Some(Event::Dht(event)))) = network.poll().map_err(|err| {
+			warn!(target: "service", "Error in network: {:?}", err);
+		}) {
+			// Given that core/authority-discovery is the only upper stack consumer of Dht events at the moment, all Dht
+			// events are being passed on to the authority-discovery module. In the future there might be multiple
+			// consumers of these events. In that case this would need to be refactored to properly dispatch the events,
+			// e.g. via a subscriber model.
+			if let Some(Err(e)) = dht_event_tx.as_ref().map(|c| c.clone().try_send(event)) {
+				if e.is_full() {
+					warn!(target: "service", "Dht event channel to authority discovery is full, dropping event.");
+				} else if e.is_disconnected() {
+					warn!(target: "service", "Dht event channel to authority discovery is disconnected, dropping event.");
+				}
+			}
+		};
 
 		// Now some diagnostic for performances.
 		let polling_dur = before_polling.elapsed();
@@ -785,8 +788,9 @@ pub struct NetworkStatus<B: BlockT> {
 	pub average_upload_per_sec: u64,
 }
 
-impl<TCfg, TBl, TCl, TSc, TNetStatus, TNet, TTxPool, TOc> Drop for
-NewService<TCfg, TBl, TCl, TSc, TNetStatus, TNet, TTxPool, TOc> {
+impl<TBl, TCl, TSc, TNetStatus, TNet, TTxPool, TOc> Drop for
+	NewService<TBl, TCl, TSc, TNetStatus, TNet, TTxPool, TOc>
+{
 	fn drop(&mut self) {
 		debug!(target: "service", "Substrate service shutdown");
 		if let Some(signal) = self.signal.take() {

@@ -125,11 +125,11 @@ use sr_primitives::{KeyTypeId, AppKey};
 use sr_primitives::weights::SimpleDispatchInfo;
 use sr_primitives::traits::{Convert, Zero, Member, OpaqueKeys};
 use sr_staking_primitives::SessionIndex;
-use srml_support::{
-	dispatch::Result, ConsensusEngineId, StorageValue, StorageDoubleMap, for_each_tuple,
-	decl_module, decl_event, decl_storage,
+use support::{
+	dispatch::Result, ConsensusEngineId, StorageValue, StorageDoubleMap, decl_module, decl_event,
+	decl_storage,
 };
-use srml_support::{ensure, traits::{OnFreeBalanceZero, Get, FindAuthor}, Parameter};
+use support::{ensure, traits::{OnFreeBalanceZero, Get, FindAuthor}, Parameter};
 use system::{self, ensure_signed};
 
 #[cfg(test)]
@@ -251,62 +251,51 @@ pub trait OneSessionHandler<ValidatorId> {
 
 	/// A validator got disabled. Act accordingly until a new session begins.
 	fn on_disabled(_validator_index: usize);
-
 }
 
-macro_rules! impl_session_handlers {
-	() => (
-		impl<AId> SessionHandler<AId> for () {
-			fn on_genesis_session<Ks: OpaqueKeys>(_: &[(AId, Ks)]) {}
-			fn on_new_session<Ks: OpaqueKeys>(_: bool, _: &[(AId, Ks)], _: &[(AId, Ks)]) {}
-			fn on_before_session_ending() {}
-			fn on_disabled(_: usize) {}
-		}
-	);
+#[impl_trait_for_tuples::impl_for_tuples(30)]
+#[tuple_types_no_default_trait_bound]
+impl<AId> SessionHandler<AId> for Tuple {
+	for_tuples!( where #( Tuple: OneSessionHandler<AId> )* );
 
-	( $($t:ident)* ) => {
-		impl<AId, $( $t: OneSessionHandler<AId> ),*> SessionHandler<AId> for ( $( $t , )* ) {
-			fn on_genesis_session<Ks: OpaqueKeys>(validators: &[(AId, Ks)]) {
-				$(
-					let our_keys: Box<dyn Iterator<Item=_>> = Box::new(validators.iter()
-						.map(|k| (&k.0, k.1.get::<$t::Key>(<$t::Key as AppKey>::ID)
-							.unwrap_or_default())));
+	fn on_genesis_session<Ks: OpaqueKeys>(validators: &[(AId, Ks)]) {
+		for_tuples!(
+			#(
+				let our_keys: Box<dyn Iterator<Item=_>> = Box::new(validators.iter()
+					.map(|k| (&k.0, k.1.get::<Tuple::Key>(<Tuple::Key as AppKey>::ID)
+						.unwrap_or_default())));
 
-					$t::on_genesis_session(our_keys);
-				)*
-			}
-			fn on_new_session<Ks: OpaqueKeys>(
-				changed: bool,
-				validators: &[(AId, Ks)],
-				queued_validators: &[(AId, Ks)],
-			) {
-				$(
-					let our_keys: Box<dyn Iterator<Item=_>> = Box::new(validators.iter()
-						.map(|k| (&k.0, k.1.get::<$t::Key>(<$t::Key as AppKey>::ID)
-							.unwrap_or_default())));
-					let queued_keys: Box<dyn Iterator<Item=_>> = Box::new(queued_validators.iter()
-						.map(|k| (&k.0, k.1.get::<$t::Key>(<$t::Key as AppKey>::ID)
-							.unwrap_or_default())));
-					$t::on_new_session(changed, our_keys, queued_keys);
-				)*
-			}
+				Tuple::on_genesis_session(our_keys);
+			)*
+		)
+	}
 
-			fn on_before_session_ending() {
-				$(
-					$t::on_before_session_ending();
-				)*
-			}
+	fn on_new_session<Ks: OpaqueKeys>(
+		changed: bool,
+		validators: &[(AId, Ks)],
+		queued_validators: &[(AId, Ks)],
+	) {
+		for_tuples!(
+			#(
+				let our_keys: Box<dyn Iterator<Item=_>> = Box::new(validators.iter()
+					.map(|k| (&k.0, k.1.get::<Tuple::Key>(<Tuple::Key as AppKey>::ID)
+						.unwrap_or_default())));
+				let queued_keys: Box<dyn Iterator<Item=_>> = Box::new(queued_validators.iter()
+					.map(|k| (&k.0, k.1.get::<Tuple::Key>(<Tuple::Key as AppKey>::ID)
+						.unwrap_or_default())));
+				Tuple::on_new_session(changed, our_keys, queued_keys);
+			)*
+		)
+	}
 
-			fn on_disabled(i: usize) {
-				$(
-					$t::on_disabled(i);
-				)*
-			}
-		}
+	fn on_before_session_ending() {
+		for_tuples!( #( Tuple::on_before_session_ending(); )* )
+	}
+
+	fn on_disabled(i: usize) {
+		for_tuples!( #( Tuple::on_disabled(i); )* )
 	}
 }
-
-for_each_tuple!(impl_session_handlers);
 
 /// Handler for selecting the genesis validator set.
 pub trait SelectInitialValidators<ValidatorId> {
@@ -381,41 +370,36 @@ decl_storage! {
 	}
 	add_extra_genesis {
 		config(keys): Vec<(T::ValidatorId, T::Keys)>;
-		build(|
-			storage: &mut (sr_primitives::StorageOverlay, sr_primitives::ChildrenStorageOverlay),
-			config: &GenesisConfig<T>
-		| {
-			runtime_io::with_storage(storage, || {
-				for (who, keys) in config.keys.iter().cloned() {
-					assert!(
-						<Module<T>>::load_keys(&who).is_none(),
-						"genesis config contained duplicate validator {:?}", who,
-					);
+		build(|config: &GenesisConfig<T>| {
+			for (who, keys) in config.keys.iter().cloned() {
+				assert!(
+					<Module<T>>::load_keys(&who).is_none(),
+					"genesis config contained duplicate validator {:?}", who,
+				);
 
-					<Module<T>>::do_set_keys(&who, keys)
-						.expect("genesis config must not contain duplicates; qed");
-				}
+				<Module<T>>::do_set_keys(&who, keys)
+					.expect("genesis config must not contain duplicates; qed");
+			}
 
-				let initial_validators = T::SelectInitialValidators::select_initial_validators()
-					.unwrap_or_else(|| config.keys.iter().map(|(ref v, _)| v.clone()).collect());
+			let initial_validators = T::SelectInitialValidators::select_initial_validators()
+				.unwrap_or_else(|| config.keys.iter().map(|(ref v, _)| v.clone()).collect());
 
-				assert!(!initial_validators.is_empty(), "Empty validator set in genesis block!");
+			assert!(!initial_validators.is_empty(), "Empty validator set in genesis block!");
 
-				let queued_keys: Vec<_> = initial_validators
-					.iter()
-					.cloned()
-					.map(|v| (
-						v.clone(),
-						<Module<T>>::load_keys(&v).unwrap_or_default(),
-					))
-					.collect();
+			let queued_keys: Vec<_> = initial_validators
+				.iter()
+				.cloned()
+				.map(|v| (
+					v.clone(),
+					<Module<T>>::load_keys(&v).unwrap_or_default(),
+				))
+				.collect();
 
-				// Tell everyone about the genesis session keys
-				T::SessionHandler::on_genesis_session::<T::Keys>(&queued_keys);
+			// Tell everyone about the genesis session keys
+			T::SessionHandler::on_genesis_session::<T::Keys>(&queued_keys);
 
-				<Validators<T>>::put(initial_validators);
-				<QueuedKeys<T>>::put(queued_keys);
-			});
+			<Validators<T>>::put(initial_validators);
+			<QueuedKeys<T>>::put(queued_keys);
 		});
 	}
 }
@@ -656,7 +640,7 @@ impl<T: Trait, Inner: FindAuthor<u32>> FindAuthor<T::ValidatorId>
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use srml_support::assert_ok;
+	use support::assert_ok;
 	use runtime_io::with_externalities;
 	use primitives::{Blake2Hasher, crypto::key_types::DUMMY};
 	use sr_primitives::{

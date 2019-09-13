@@ -38,7 +38,9 @@ use substrate_client::{
 };
 use sr_primitives::{
 	ApplyResult, create_runtime_str, Perbill, impl_opaque_keys,
-	transaction_validity::{TransactionValidity, ValidTransaction},
+	transaction_validity::{
+		TransactionValidity, ValidTransaction, TransactionValidityError, InvalidTransaction,
+	},
 	traits::{
 		BlindCheckable, BlakeTwo256, Block as BlockT, Extrinsic as ExtrinsicT,
 		GetNodeBlockType, GetRuntimeBlockType, Verify, IdentityLookup,
@@ -123,17 +125,17 @@ impl serde::Serialize for Extrinsic {
 impl BlindCheckable for Extrinsic {
 	type Checked = Self;
 
-	fn check(self) -> Result<Self, &'static str> {
+	fn check(self) -> Result<Self, TransactionValidityError> {
 		match self {
 			Extrinsic::AuthoritiesChange(new_auth) => Ok(Extrinsic::AuthoritiesChange(new_auth)),
 			Extrinsic::Transfer(transfer, signature) => {
 				if sr_primitives::verify_encoded_lazy(&signature, &transfer, &transfer.from) {
 					Ok(Extrinsic::Transfer(transfer, signature))
 				} else {
-					Err(sr_primitives::BAD_SIGNATURE)
+					Err(InvalidTransaction::BadProof.into())
 				}
 			},
-			Extrinsic::IncludeData(_) => Err(sr_primitives::BAD_SIGNATURE),
+			Extrinsic::IncludeData(_) => Err(InvalidTransaction::BadProof.into()),
 			Extrinsic::StorageChange(key, value) => Ok(Extrinsic::StorageChange(key, value)),
 		}
 	}
@@ -141,6 +143,7 @@ impl BlindCheckable for Extrinsic {
 
 impl ExtrinsicT for Extrinsic {
 	type Call = Extrinsic;
+	type SignaturePayload = ();
 
 	fn is_signed(&self) -> Option<bool> {
 		if let Extrinsic::IncludeData(_) = *self {
@@ -150,7 +153,7 @@ impl ExtrinsicT for Extrinsic {
 		}
 	}
 
-	fn new_unsigned(call: Self::Call) -> Option<Self> {
+	fn new(call: Self::Call, _signature_payload: Option<Self::SignaturePayload>) -> Option<Self> {
 		Some(call)
 	}
 }
@@ -277,6 +280,8 @@ cfg_if! {
 				///
 				/// Returns the signature generated for the message `sr25519`.
 				fn test_sr25519_crypto() -> (sr25519::AppSignature, sr25519::AppPublic);
+				/// Run various tests against storage.
+				fn test_storage();
 			}
 		}
 	} else {
@@ -319,6 +324,8 @@ cfg_if! {
 				///
 				/// Returns the signature generated for the message `sr25519`.
 				fn test_sr25519_crypto() -> (sr25519::AppSignature, sr25519::AppPublic);
+				/// Run various tests against storage.
+				fn test_storage();
 			}
 		}
 	}
@@ -477,7 +484,7 @@ cfg_if! {
 			impl client_api::TaggedTransactionQueue<Block> for Runtime {
 				fn validate_transaction(utx: <Block as BlockT>::Extrinsic) -> TransactionValidity {
 					if let Extrinsic::IncludeData(data) = utx {
-						return TransactionValidity::Valid(ValidTransaction {
+						return Ok(ValidTransaction {
 							priority: data.len() as u64,
 							requires: vec![],
 							provides: vec![data],
@@ -587,6 +594,11 @@ cfg_if! {
 				fn test_sr25519_crypto() -> (sr25519::AppSignature, sr25519::AppPublic) {
 					test_sr25519_crypto()
 				}
+
+				fn test_storage() {
+					test_read_storage();
+					test_read_child_storage();
+				}
 			}
 
 			impl aura_primitives::AuraApi<Block, AuraId> for Runtime {
@@ -626,7 +638,7 @@ cfg_if! {
 			impl offchain_primitives::OffchainWorkerApi<Block> for Runtime {
 				fn offchain_worker(block: u64) {
 					let ex = Extrinsic::IncludeData(block.encode());
-					runtime_io::submit_transaction(&ex).unwrap();
+					runtime_io::submit_transaction(ex.encode()).unwrap();
 				}
 			}
 
@@ -661,7 +673,7 @@ cfg_if! {
 			impl client_api::TaggedTransactionQueue<Block> for Runtime {
 				fn validate_transaction(utx: <Block as BlockT>::Extrinsic) -> TransactionValidity {
 					if let Extrinsic::IncludeData(data) = utx {
-						return TransactionValidity::Valid(ValidTransaction{
+						return Ok(ValidTransaction{
 							priority: data.len() as u64,
 							requires: vec![],
 							provides: vec![data],
@@ -802,6 +814,11 @@ cfg_if! {
 				fn test_sr25519_crypto() -> (sr25519::AppSignature, sr25519::AppPublic) {
 					test_sr25519_crypto()
 				}
+
+				fn test_storage() {
+					test_read_storage();
+					test_read_child_storage();
+				}
 			}
 
 			impl aura_primitives::AuraApi<Block, AuraId> for Runtime {
@@ -841,7 +858,7 @@ cfg_if! {
 			impl offchain_primitives::OffchainWorkerApi<Block> for Runtime {
 				fn offchain_worker(block: u64) {
 					let ex = Extrinsic::IncludeData(block.encode());
-					runtime_io::submit_transaction(&ex).unwrap()
+					runtime_io::submit_transaction(ex.encode()).unwrap()
 				}
 			}
 
@@ -882,6 +899,46 @@ fn test_sr25519_crypto() -> (sr25519::AppSignature, sr25519::AppPublic) {
 	let signature = public0.sign(&"sr25519").expect("Generates a valid `sr25519` signature.");
 	assert!(public0.verify(&"sr25519", &signature));
 	(signature, public0)
+}
+
+fn test_read_storage() {
+	const KEY: &[u8] = b":read_storage";
+	runtime_io::set_storage(KEY, b"test");
+
+	let mut v = [0u8; 4];
+	let r = runtime_io::read_storage(
+		KEY,
+		&mut v,
+		0
+	);
+	assert_eq!(r, Some(4));
+	assert_eq!(&v, b"test");
+
+	let mut v = [0u8; 4];
+	let r = runtime_io::read_storage(KEY, &mut v, 8);
+	assert_eq!(r, Some(4));
+	assert_eq!(&v, &[0, 0, 0, 0]);
+}
+
+fn test_read_child_storage() {
+	const CHILD_KEY: &[u8] = b":child_storage:default:read_child_storage";
+	const KEY: &[u8] = b":read_child_storage";
+	runtime_io::set_child_storage(CHILD_KEY, KEY, b"test");
+
+	let mut v = [0u8; 4];
+	let r = runtime_io::read_child_storage(
+		CHILD_KEY,
+		KEY,
+		&mut v,
+		0
+	);
+	assert_eq!(r, Some(4));
+	assert_eq!(&v, b"test");
+
+	let mut v = [0u8; 4];
+	let r = runtime_io::read_child_storage(CHILD_KEY, KEY, &mut v, 8);
+	assert_eq!(r, Some(4));
+	assert_eq!(&v, &[0, 0, 0, 0]);
 }
 
 #[cfg(test)]
@@ -977,5 +1034,16 @@ mod tests {
 		// Allocation of 1024k while having ~2048k should succeed.
 		let ret = runtime_api.vec_with_capacity(&new_block_id, 1048576);
 		assert!(ret.is_ok());
+	}
+
+	#[test]
+	fn test_storage() {
+		let client = TestClientBuilder::new()
+			.set_execution_strategy(ExecutionStrategy::Both)
+			.build();
+		let runtime_api = client.runtime_api();
+		let block_id = BlockId::Number(client.info().chain.best_number);
+
+		runtime_api.test_storage(&block_id).unwrap();
 	}
 }

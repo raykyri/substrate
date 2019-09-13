@@ -46,14 +46,13 @@ macro_rules! new_full_start {
 	($config:expr) => {{
 		let mut import_setup = None;
 		let inherent_data_providers = inherents::InherentDataProviders::new();
-		let mut tasks_to_spawn = None;
+		let mut tasks_to_spawn = Vec::new();
 
 		let builder = substrate_service::ServiceBuilder::new_full::<
 			node_primitives::Block, node_runtime::RuntimeApi, node_executor::Executor
 		>($config)?
-			.with_select_chain(|_config, client| {
-				#[allow(deprecated)]
-				Ok(client::LongestChain::new(client.backend().clone()))
+			.with_select_chain(|_config, backend| {
+				Ok(client::LongestChain::new(backend.clone()))
 			})?
 			.with_transaction_pool(|config, client|
 				Ok(transaction_pool::txpool::Pool::new(config, transaction_pool::ChainApi::new(client)))
@@ -79,7 +78,7 @@ macro_rules! new_full_start {
 				)?;
 
 				import_setup = Some((babe_block_import.clone(), link_half, babe_link));
-				tasks_to_spawn = Some(vec![Box::new(pruning_task)]);
+				tasks_to_spawn.push(Box::new(pruning_task));
 
 				Ok(import_queue)
 			})?
@@ -92,7 +91,7 @@ macro_rules! new_full_start {
 				);
 				io
 			})?;
-		
+
 		(builder, import_setup, inherent_data_providers, tasks_to_spawn)
 	}}
 }
@@ -103,31 +102,44 @@ macro_rules! new_full_start {
 /// concrete types instead.
 macro_rules! new_full {
 	($config:expr) => {{
-		use futures::Future;
+		use futures::sync::mpsc;
+		use network::DhtEvent;
 
-		let (builder, mut import_setup, inherent_data_providers, mut tasks_to_spawn) = new_full_start!($config);
+		let (
+			is_authority,
+			force_authoring,
+			name,
+			disable_grandpa
+		) = (
+			$config.roles.is_authority(),
+			$config.force_authoring,
+			$config.name.clone(),
+			$config.disable_grandpa
+		);
+
+		let (builder, mut import_setup, inherent_data_providers, tasks_to_spawn) = new_full_start!($config);
+
+		// Dht event channel from the network to the authority discovery module. Use bounded channel to ensure
+		// back-pressure. Authority discovery is triggering one event per authority within the current authority set.
+		// This estimates the authority set size to be somewhere below 10 000 thereby setting the channel buffer size to
+		// 10 000.
+		let (dht_event_tx, dht_event_rx) =
+			mpsc::channel::<DhtEvent>(10000);
 
 		let service = builder.with_network_protocol(|_| Ok(crate::service::NodeProtocol::new()))?
-			.with_finality_proof_provider(|client|
-				Ok(Arc::new(grandpa::FinalityProofProvider::new(client.clone(), client)) as _)
+			.with_finality_proof_provider(|client, backend|
+				Ok(Arc::new(grandpa::FinalityProofProvider::new(backend, client)) as _)
 			)?
+			.with_dht_event_tx(dht_event_tx)?
 			.build()?;
 
 		let (block_import, link_half, babe_link) = import_setup.take()
 				.expect("Link Half and Block Import are present for Full Services or setup failed before. qed");
 
 		// spawn any futures that were created in the previous setup steps
-		if let Some(tasks) = tasks_to_spawn.take() {
-			for task in tasks {
-				service.spawn_task(
-					task.select(service.on_exit())
-						.map(|_| ())
-						.map_err(|_| ())
-				);
-			}
-		}
+		tasks_to_spawn.into_iter().for_each(|t| service.spawn_task(t));
 
-		if service.config().roles.is_authority() {
+		if is_authority {
 			let proposer = substrate_basic_authorship::ProposerFactory {
 				client: service.client(),
 				transaction_pool: service.transaction_pool(),
@@ -146,24 +158,30 @@ macro_rules! new_full {
 				env: proposer,
 				sync_oracle: service.network(),
 				inherent_data_providers: inherent_data_providers.clone(),
-				force_authoring: service.config().force_authoring,
+				force_authoring: force_authoring,
 				time_source: babe_link,
 			};
 
 			let babe = babe::start_babe(babe_config)?;
-			let select = babe.select(service.on_exit()).then(|_| Ok(()));
-			service.spawn_task(Box::new(select));
+			service.spawn_essential_task(babe);
+
+			let authority_discovery = authority_discovery::AuthorityDiscovery::new(
+				service.client(),
+				service.network(),
+				dht_event_rx,
+			);
+			service.spawn_task(authority_discovery);
 		}
 
 		let config = grandpa::Config {
 			// FIXME #1578 make this available through chainspec
 			gossip_duration: std::time::Duration::from_millis(333),
 			justification_period: 4096,
-			name: Some(service.config().name.clone()),
+			name: Some(name),
 			keystore: Some(service.keystore()),
 		};
 
-		match (service.config().roles.is_authority(), service.config().disable_grandpa) {
+		match (is_authority, disable_grandpa) {
 			(false, false) => {
 				// start the lightweight GRANDPA observer
 				service.spawn_task(Box::new(grandpa::run_grandpa_observer(
@@ -207,32 +225,31 @@ pub fn new_full<C: Send + Default + 'static>(config: Configuration<C, GenesisCon
 /// Builds a new service for a light client.
 pub fn new_light<C: Send + Default + 'static>(config: Configuration<C, GenesisConfig>)
 -> Result<impl AbstractService, ServiceError> {
-	let inherent_data_providers = InherentDataProviders::new();
+	use futures::Future;
 
-	ServiceBuilder::new_light::<Block, RuntimeApi, node_executor::Executor>(config)?
-		.with_select_chain(|_config, client| {
-			#[allow(deprecated)]
-			Ok(LongestChain::new(client.backend().clone()))
+	let inherent_data_providers = InherentDataProviders::new();
+	let mut tasks_to_spawn = Vec::new();
+
+	let service = ServiceBuilder::new_light::<Block, RuntimeApi, node_executor::Executor>(config)?
+		.with_select_chain(|_config, backend| {
+			Ok(LongestChain::new(backend.clone()))
 		})?
 		.with_transaction_pool(|config, client|
 			Ok(TransactionPool::new(config, transaction_pool::ChainApi::new(client)))
 		)?
-		.with_import_queue_and_fprb(|_config, client, _select_chain, transaction_pool| {
-			#[allow(deprecated)]
-			let fetch_checker = client.backend().blockchain().fetcher()
-				.upgrade()
+		.with_import_queue_and_fprb(|_config, client, backend, fetcher, _select_chain, transaction_pool| {
+			let fetch_checker = fetcher
 				.map(|fetcher| fetcher.checker().clone())
 				.ok_or_else(|| "Trying to start light import queue without active fetch checker")?;
 			let block_import = grandpa::light_block_import::<_, _, _, RuntimeApi, _>(
-				client.clone(), Arc::new(fetch_checker), client.clone()
+				client.clone(), backend, Arc::new(fetch_checker), client.clone()
 			)?;
 
 			let finality_proof_import = block_import.clone();
 			let finality_proof_request_builder =
 				finality_proof_import.create_finality_proof_request_builder();
 
-			// FIXME: pruning task isn't started since light client doesn't do `AuthoritySetup`.
-			let (import_queue, ..) = import_queue(
+			let (import_queue, _, _, pruning_task) = import_queue(
 				Config::get_or_compute(&*client)?,
 				block_import,
 				None,
@@ -243,22 +260,41 @@ pub fn new_light<C: Send + Default + 'static>(config: Configuration<C, GenesisCo
 				Some(transaction_pool)
 			)?;
 
+			tasks_to_spawn.push(Box::new(pruning_task));
+
 			Ok((import_queue, finality_proof_request_builder))
 		})?
 		.with_network_protocol(|_| Ok(NodeProtocol::new()))?
-		.with_finality_proof_provider(|client|
-			Ok(Arc::new(GrandpaFinalityProofProvider::new(client.clone(), client)) as _)
+		.with_finality_proof_provider(|client, backend|
+			Ok(Arc::new(GrandpaFinalityProofProvider::new(backend, client)) as _)
 		)?
 		.with_rpc_extensions(|client, pool| {
-			use node_rpc::accounts::{Accounts, AccountsApi};
+			use node_rpc::{
+				accounts::{Accounts, AccountsApi},
+				contracts::{Contracts, ContractsApi},
+			};
 
 			let mut io = jsonrpc_core::IoHandler::default();
 			io.extend_with(
-				AccountsApi::to_delegate(Accounts::new(client, pool))
+				AccountsApi::to_delegate(Accounts::new(client.clone(), pool))
+			);
+			io.extend_with(
+				ContractsApi::to_delegate(Contracts::new(client))
 			);
 			io
 		})?
-		.build()
+		.build()?;
+
+	// spawn any futures that were created in the previous setup steps
+	for task in tasks_to_spawn.drain(..) {
+		service.spawn_task(
+			task.select(service.on_exit())
+				.map(|_| ())
+				.map_err(|_| ())
+		);
+	}
+
+	Ok(service)
 }
 
 #[cfg(test)]
@@ -270,13 +306,13 @@ mod tests {
 	};
 	use node_primitives::DigestItem;
 	use node_runtime::{BalancesCall, Call, UncheckedExtrinsic};
-	use node_runtime::constants::{currency::CENTS, time::SLOT_DURATION};
+	use node_runtime::constants::{currency::CENTS, time::{PRIMARY_PROBABILITY, SLOT_DURATION}};
 	use codec::{Encode, Decode};
 	use primitives::{
 		crypto::Pair as CryptoPair, blake2_256,
 		sr25519::Public as AddressPublic, H256,
 	};
-	use sr_primitives::{generic::{BlockId, Era, Digest}, traits::Block, OpaqueExtrinsic};
+	use sr_primitives::{generic::{BlockId, Era, Digest, SignedPayload}, traits::Block, OpaqueExtrinsic};
 	use timestamp;
 	use finality_tracker;
 	use keyring::AccountKeyring;
@@ -391,7 +427,7 @@ mod tests {
 						slot_num,
 						&parent_header,
 						&*service.client(),
-						(278, 1000),
+						PRIMARY_PROBABILITY,
 						&keystore,
 					) {
 						break babe_pre_digest;
@@ -448,16 +484,26 @@ mod tests {
 				let check_nonce = system::CheckNonce::from(index);
 				let check_weight = system::CheckWeight::new();
 				let take_fees = balances::TakeFees::from(0);
-				let extra = (check_version, check_genesis, check_era, check_nonce, check_weight, take_fees);
-
-				let raw_payload = (function, extra.clone(), version, genesis_hash, genesis_hash);
-				let signature = raw_payload.using_encoded(|payload| if payload.len() > 256 {
-					signer.sign(&blake2_256(payload)[..])
-				} else {
+				let extra = (
+					check_version,
+					check_genesis,
+					check_era,
+					check_nonce,
+					check_weight,
+					take_fees,
+					Default::default(),
+				);
+				let raw_payload = SignedPayload::from_raw(
+					function,
+					extra,
+					(version, genesis_hash, genesis_hash, (), (), (), ())
+				);
+				let signature = raw_payload.using_encoded(|payload|	{
 					signer.sign(payload)
 				});
+				let (function, extra, _) = raw_payload.deconstruct();
 				let xt = UncheckedExtrinsic::new_signed(
-					raw_payload.0,
+					function,
 					from.into(),
 					signature.into(),
 					extra,
